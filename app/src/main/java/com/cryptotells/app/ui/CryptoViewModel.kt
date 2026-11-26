@@ -17,12 +17,17 @@ data class CryptoUiState(
     val amountInput: String = "100",
     val isCurrencyToCrypto: Boolean = true,
     val selectedCurrency: FiatCurrency = FiatCurrency("usd", "US Dollar"),
-    val selectedCoin: CryptoCoin = CryptoCoin("bitcoin", "BTC", "Bitcoin"),
+    val selectedCoin: CryptoCoin = CryptoCoin("btc-bitcoin", "BTC", "Bitcoin"),
     val currencies: List<FiatCurrency> = CryptoRepository.POPULAR_CURRENCIES.map { FiatCurrency(it.key, it.value) },
+    val usdRates: Map<String, Double> = mapOf("usd" to 1.0),
+    val topCoinsUsd: List<CryptoCoin> = emptyList(),
     val topCoins: List<CryptoCoin> = emptyList(),
     val searchResults: List<CryptoCoin> = emptyList(),
     val coinSearchQuery: String = "",
     val currencySearchQuery: String = "",
+    val selectedCoinUsdPrice: Double? = null,
+    val selectedCoinChange24h: Double? = null,
+    val selectedCoinMarketCap: Double? = null,
     val quote: QuoteResult? = null,
     val isLoading: Boolean = false,
     val isSearchingCoins: Boolean = false,
@@ -46,19 +51,23 @@ class CryptoViewModel(
         viewModelScope.launch {
             uiState = uiState.copy(isLoading = true, errorMessage = null)
             try {
-                val currencies = repo.fetchSupportedCurrencies()
-                val topCoins = repo.fetchTopCoins(uiState.selectedCurrency.code)
-                val defaultCoin = topCoins.firstOrNull { it.id == uiState.selectedCoin.id }
-                    ?: topCoins.firstOrNull()
+                val (currencies, rates) = repo.fetchUsdRates()
+                val topCoinsUsd = repo.fetchTopCoinsUsd(100)
+                val defaultCoin = topCoinsUsd.firstOrNull { it.id == uiState.selectedCoin.id }
+                    ?: topCoinsUsd.firstOrNull()
                     ?: uiState.selectedCoin
-                val quote = repo.fetchQuote(defaultCoin.id, uiState.selectedCurrency.code)
+
                 uiState = uiState.copy(
                     currencies = currencies,
-                    topCoins = topCoins,
+                    usdRates = rates,
+                    topCoinsUsd = topCoinsUsd,
                     selectedCoin = defaultCoin,
-                    quote = quote,
+                    selectedCoinUsdPrice = defaultCoin.currentPrice,
+                    selectedCoinChange24h = defaultCoin.priceChange24hPct,
+                    selectedCoinMarketCap = defaultCoin.marketCap,
                     isLoading = false
                 )
+                recomputeConvertedRates()
             } catch (e: Exception) {
                 uiState = uiState.copy(
                     isLoading = false,
@@ -66,6 +75,29 @@ class CryptoViewModel(
                 )
             }
         }
+    }
+
+    private fun recomputeConvertedRates() {
+        val fxRate = uiState.usdRates[uiState.selectedCurrency.code.lowercase()] ?: 1.0
+        val convertedTop = uiState.topCoinsUsd.map { coin ->
+            coin.copy(currentPrice = coin.currentPrice?.times(fxRate))
+        }
+        val usdPrice = uiState.selectedCoinUsdPrice
+        val quote = if (usdPrice != null) {
+            QuoteResult(
+                coinId = uiState.selectedCoin.id,
+                vsCurrency = uiState.selectedCurrency.code,
+                unitPrice = usdPrice * fxRate,
+                change24hPct = uiState.selectedCoinChange24h,
+                marketCap = uiState.selectedCoinMarketCap?.times(fxRate),
+                lastUpdatedEpochSec = null
+            )
+        } else null
+
+        uiState = uiState.copy(
+            topCoins = convertedTop,
+            quote = quote
+        )
     }
 
     fun onAmountChange(value: String) {
@@ -83,28 +115,27 @@ class CryptoViewModel(
         uiState = uiState.copy(
             selectedCurrency = currency,
             currencySearchQuery = "",
-            isLoading = true,
             errorMessage = null
         )
-        viewModelScope.launch {
-            try {
-                val quote = repo.fetchQuote(uiState.selectedCoin.id, currency.code)
-                val topCoins = repo.fetchTopCoins(currency.code)
-                uiState = uiState.copy(
-                    quote = quote,
-                    topCoins = topCoins,
-                    isLoading = false
-                )
-            } catch (e: Exception) {
-                uiState = uiState.copy(
-                    isLoading = false,
-                    errorMessage = e.message ?: "Failed to load rate for ${currency.code.uppercase()}"
-                )
-            }
-        }
+        recomputeConvertedRates()
     }
 
     fun selectCoin(coin: CryptoCoin) {
+        val cached = uiState.topCoinsUsd.firstOrNull { it.id == coin.id }
+        if (cached?.currentPrice != null) {
+            uiState = uiState.copy(
+                selectedCoin = cached,
+                coinSearchQuery = "",
+                searchResults = emptyList(),
+                selectedCoinUsdPrice = cached.currentPrice,
+                selectedCoinChange24h = cached.priceChange24hPct,
+                selectedCoinMarketCap = cached.marketCap,
+                errorMessage = null
+            )
+            recomputeConvertedRates()
+            return
+        }
+
         uiState = uiState.copy(
             selectedCoin = coin,
             coinSearchQuery = "",
@@ -114,8 +145,14 @@ class CryptoViewModel(
         )
         viewModelScope.launch {
             try {
-                val quote = repo.fetchQuote(coin.id, uiState.selectedCurrency.code)
-                uiState = uiState.copy(quote = quote, isLoading = false)
+                val usdQuote = repo.fetchCoinUsdQuote(coin.id)
+                uiState = uiState.copy(
+                    selectedCoinUsdPrice = usdQuote.unitPrice,
+                    selectedCoinChange24h = usdQuote.change24hPct,
+                    selectedCoinMarketCap = usdQuote.marketCap,
+                    isLoading = false
+                )
+                recomputeConvertedRates()
             } catch (e: Exception) {
                 uiState = uiState.copy(
                     isLoading = false,
@@ -149,6 +186,6 @@ class CryptoViewModel(
     }
 
     fun refreshQuote() {
-        selectCoin(uiState.selectedCoin)
+        loadInitialData()
     }
 }
